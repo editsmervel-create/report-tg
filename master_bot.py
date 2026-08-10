@@ -69,6 +69,8 @@ def default_state():
         "clients": {},
         "otp_pending": {},
         "twofa_pending": {},
+        "login_stage": None,
+        "pending_phones": [],
         "reporting_running": False,
         "report_task": None,
         "total_reports": 0,
@@ -102,6 +104,10 @@ def save_state():
                 "proofs_sent": STATE["proofs_sent"],
                 "start_time": STATE["start_time"],
                 "last_round_at": STATE["last_round_at"],
+                "otp_pending": STATE.get("otp_pending") or {},
+                "twofa_pending": STATE.get("twofa_pending") or {},
+                "login_stage": STATE.get("login_stage"),
+                "pending_phones": STATE.get("pending_phones") or [],
             }
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -548,12 +554,17 @@ async def cmd_login(msg: types.Message, state: FSMContext):
     if not await is_owner(msg.chat.id):
         return await msg.answer("⛔ Access Denied.")
     await state.set_state(BotFSM.waiting_otp_phone)
+    STATE["login_stage"] = "waiting_phone"
+    STATE["pending_phones"] = []
+    save_state()
     await msg.answer(
         "📱 <b>Login Account</b>\n\n"
         "Send me the phone number with country code.\n"
         "Example: <code>+919876543210</code>\n\n"
         "Or send MULTIPLE numbers separated by newlines:\n"
         "<code>+919876543210\n+919123456789</code>\n\n"
+        "After you receive OTP, you can send just the code (example: <code>44196</code>)\n"
+        "OR <code>PHONE:OTP</code>\n\n"
         "/cancel to abort."
     )
 
@@ -561,12 +572,18 @@ async def cmd_login(msg: types.Message, state: FSMContext):
 @dp.message(Command("cancel"))
 async def cmd_cancel(msg: types.Message, state: FSMContext):
     await state.clear()
+    STATE["login_stage"] = None
+    STATE["pending_phones"] = []
+    save_state()
     await msg.answer("♻️ Cancelled.")
 
 
 @dp.message()
 async def fallback_login_inputs(msg: types.Message, state: FSMContext):
     if not await is_owner(msg.chat.id):
+        return
+    text = (msg.text or "").strip()
+    if not text or text.startswith("/"):
         return
     try:
         cur_state = await state.get_state()
@@ -578,72 +595,186 @@ async def fallback_login_inputs(msg: types.Message, state: FSMContext):
         getattr(BotFSM.waiting_2fa, "state", None),
     ):
         return
-    text = (msg.text or "").strip()
-    if ":" not in text:
-        return
-
-    raw_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    pairs = {}
-    for ln in raw_lines:
-        if ":" not in ln:
-            continue
-        ph, val = ln.split(":", 1)
-        ph = ph.strip().replace(" ", "")
-        val = val.strip()
-        if ph and val:
-            pairs[ph] = val
-
-    if not pairs:
-        return
-
+    stage = STATE.get("login_stage")
     otp_pending = STATE.get("otp_pending") or {}
     twofa_pending = STATE.get("twofa_pending") or {}
 
-    handled = False
-    for phone, val in pairs.items():
-        if phone in otp_pending and phone in STATE.get("clients", {}):
-            client = STATE["clients"][phone]
+    if stage is None:
+        if twofa_pending:
+            stage = "waiting_2fa"
+        elif otp_pending:
+            stage = "waiting_otp"
+
+    if stage is None:
+        return
+
+    if stage == "waiting_phone":
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        valid = []
+        for ln in lines:
+            ln2 = ln.strip().replace(" ", "")
+            if ln2.startswith("+") and len(ln2) >= 10 and ln2[1:].isdigit():
+                valid.append(ln2)
+        if not valid:
+            return await msg.answer("❌ Phone format galat. Example: <code>+91XXXXXXXXXX</code>")
+
+        pending = []
+        for phone in valid:
+            client = await get_telethon_client(phone, create_new=True)
             try:
+                if await client.is_user_authorized():
+                    continue
+                sent = await client.send_code_request(phone)
+                STATE["otp_pending"][phone] = {"phone_code_hash": sent.phone_code_hash, "client_ref": True}
+                pending.append(phone)
+            except PhoneNumberUnoccupiedError:
+                await msg.answer(f"❌ Phone <code>{phone}</code> not registered on Telegram.")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                STATE["clients"].pop(phone, None)
+                STATE["otp_pending"].pop(phone, None)
+            except FloodWaitError as e:
+                await msg.answer(f"⏱️ FloodWait on <code>{phone}</code>: {e.seconds}s. Try later.")
+                STATE["clients"].pop(phone, None)
+                STATE["otp_pending"].pop(phone, None)
+            except Exception as e:
+                await msg.answer(f"❌ Error for {phone}: {e}")
+                STATE["clients"].pop(phone, None)
+                STATE["otp_pending"].pop(phone, None)
+
+        STATE["pending_phones"] = pending
+        STATE["login_stage"] = "waiting_otp" if pending else None
+        save_state()
+        if not pending:
+            return await msg.answer("✅ Ye phone already logged in lag rahe hain. /accounts check karo.")
+        if len(pending) == 1:
+            return await msg.answer(f"🔐 OTP aa gaya to sirf code bhejo (example: <code>44196</code>)\nPhone: <code>{pending[0]}</code>")
+        return await msg.answer("🔐 OTP aa gaya to sirf code bhejo (example: <code>44196</code>) ya <code>PHONE:OTP</code>")
+
+    if stage == "waiting_otp":
+        raw_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        pairs = {}
+        for ln in raw_lines:
+            if ":" in ln:
+                ph, val = ln.split(":", 1)
+                ph = ph.strip().replace(" ", "")
+                val = val.strip()
+                if ph and val:
+                    pairs[ph] = val
+        if not pairs:
+            otp = "".join(ch for ch in text if ch.isdigit())
+            if not otp:
+                return
+            phone = None
+            if STATE.get("pending_phones"):
+                phone = STATE["pending_phones"][0]
+            elif otp_pending:
+                phone = list(otp_pending.keys())[0]
+            if not phone:
+                return
+            pairs = {phone: otp}
+
+        handled_any = False
+        for phone, otp in pairs.items():
+            if phone not in otp_pending:
+                continue
+            if phone not in STATE.get("clients", {}):
+                await get_telethon_client(phone, create_new=True)
+            client = STATE.get("clients", {}).get(phone)
+            if not client:
+                continue
+            try:
+                await msg.answer("⏳ OTP check ho raha hai...")
                 phone_code_hash = otp_pending.get(phone, {}).get("phone_code_hash")
                 if phone_code_hash:
-                    await client.sign_in(phone=phone, code=val, phone_code_hash=phone_code_hash)
+                    await client.sign_in(phone=phone, code=otp, phone_code_hash=phone_code_hash)
                 else:
-                    await client.sign_in(phone, val)
+                    await client.sign_in(phone, otp)
                 me = await client.get_me()
                 STATE["otp_pending"].pop(phone, None)
+                if phone in (STATE.get("pending_phones") or []):
+                    STATE["pending_phones"] = [p for p in STATE["pending_phones"] if p != phone]
+                handled_any = True
                 await msg.answer(f"✅ <b>Logged In</b>\nPhone: <code>{phone}</code>\nUsername: @{me.username}\nID: <code>{me.id}</code>")
-                handled = True
             except SessionPasswordNeededError:
                 STATE["twofa_pending"][phone] = True
-                await msg.answer(f"🔐 2FA required for <code>{phone}</code>. Send: <code>{phone}:PASSWORD</code>")
-                handled = True
+                STATE["login_stage"] = "waiting_2fa"
+                save_state()
+                handled_any = True
+                await msg.answer(f"🔐 2FA required.\nSend password only (example: <code>mypassword</code>)\nOR <code>{phone}:PASSWORD</code>")
             except PhoneCodeInvalidError:
-                await msg.answer(f"❌ Wrong OTP for <code>{phone}</code>. Run /login again to request a fresh OTP.")
-                handled = True
+                handled_any = True
+                await msg.answer("❌ OTP galat ya expire. /login karke fresh OTP lo.")
             except FloodWaitError as e:
-                await msg.answer(f"⏱️ FloodWait <code>{phone}</code>: {e.seconds}s. Try later.")
-                handled = True
+                handled_any = True
+                await msg.answer(f"⏱️ FloodWait: {e.seconds}s. Try later.")
             except Exception as e:
+                handled_any = True
                 await msg.answer(f"❌ Login failed <code>{phone}</code>: {e}")
-                handled = True
 
-        elif phone in twofa_pending and phone in STATE.get("clients", {}):
-            client = STATE["clients"][phone]
+        if handled_any:
+            if not STATE.get("otp_pending") and not STATE.get("twofa_pending"):
+                STATE["login_stage"] = None
+                STATE["pending_phones"] = []
+            save_state()
+            if getattr(config, "AUTO_START_REPORTS_AFTER_LOGIN", False) and not STATE.get("otp_pending") and not STATE.get("twofa_pending"):
+                started, _ = await start_reports_internal(bot)
+                if started:
+                    await msg.answer("🚀 Auto-started reporting. Use /status for live stats. /stop_reports to halt.")
+        return
+
+    if stage == "waiting_2fa":
+        raw_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        pairs = {}
+        for ln in raw_lines:
+            if ":" in ln:
+                ph, val = ln.split(":", 1)
+                ph = ph.strip().replace(" ", "")
+                val = val.strip()
+                if ph and val:
+                    pairs[ph] = val
+        if not pairs:
+            pwd = text
+            phone = None
+            if twofa_pending:
+                phone = list(twofa_pending.keys())[0]
+            if not phone:
+                return
+            pairs = {phone: pwd}
+
+        handled_any = False
+        for phone, pwd in pairs.items():
+            if phone not in twofa_pending:
+                continue
+            if phone not in STATE.get("clients", {}):
+                await get_telethon_client(phone, create_new=True)
+            client = STATE.get("clients", {}).get(phone)
+            if not client:
+                continue
             try:
-                await client.sign_in(password=val)
+                await msg.answer("⏳ 2FA check ho raha hai...")
+                await client.sign_in(password=pwd)
                 me = await client.get_me()
                 STATE["twofa_pending"].pop(phone, None)
                 STATE["otp_pending"].pop(phone, None)
+                handled_any = True
                 await msg.answer(f"✅ 2FA OK: <code>{phone}</code> → @{me.username}")
-                handled = True
             except Exception as e:
+                handled_any = True
                 await msg.answer(f"❌ 2FA failed <code>{phone}</code>: {e}")
-                handled = True
 
-    if handled and getattr(config, "AUTO_START_REPORTS_AFTER_LOGIN", False):
-        started, _ = await start_reports_internal(bot)
-        if started:
-            await msg.answer("🚀 Auto-started reporting. Use /status for live stats. /stop_reports to halt.")
+        if handled_any:
+            if not STATE.get("otp_pending") and not STATE.get("twofa_pending"):
+                STATE["login_stage"] = None
+                STATE["pending_phones"] = []
+            save_state()
+            if getattr(config, "AUTO_START_REPORTS_AFTER_LOGIN", False) and not STATE.get("otp_pending") and not STATE.get("twofa_pending"):
+                started, _ = await start_reports_internal(bot)
+                if started:
+                    await msg.answer("🚀 Auto-started reporting. Use /status for live stats. /stop_reports to halt.")
+        return
 
 
 @dp.message(BotFSM.waiting_otp_phone)
