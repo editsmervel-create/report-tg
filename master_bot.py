@@ -11,6 +11,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import SkipHandler
 
 from telethon import TelegramClient
 from telethon.tl.functions.account import ReportPeerRequest
@@ -599,7 +600,7 @@ async def fallback_login_inputs(msg: types.Message, state: FSMContext):
         getattr(BotFSM.waiting_otp_code, "state", None),
         getattr(BotFSM.waiting_2fa, "state", None),
     ):
-        return
+        raise SkipHandler
     stage = STATE.get("login_stage")
     otp_pending = STATE.get("otp_pending") or {}
     twofa_pending = STATE.get("twofa_pending") or {}
