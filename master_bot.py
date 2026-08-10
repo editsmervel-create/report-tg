@@ -549,6 +549,11 @@ async def cmd_help(msg: types.Message):
     )
 
 
+@dp.message(Command("ping"))
+async def cmd_ping(msg: types.Message):
+    await msg.answer("pong")
+
+
 @dp.message(Command("login"))
 async def cmd_login(msg: types.Message, state: FSMContext):
     if not await is_owner(msg.chat.id):
@@ -1161,9 +1166,20 @@ async def cmd_logout_all(msg: types.Message):
 
 
 async def on_startup():
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        log("Webhook cleared (polling mode)", "BOT")
+    except Exception as e:
+        log(f"Webhook clear failed: {e}", "WARN")
     log("=== MASTER BOT STARTING ===", "BOT")
     log(f"API_ID: {config.API_ID}  |  API_HASH: {config.API_HASH[:8]}...", "INFO")
     log(f"Bot token: {config.BOT_TOKEN[:10]}...", "BOT")
+    try:
+        me = await bot.get_me()
+        log(f"Bot ready as @{me.username} (id={me.id})", "SUCCESS")
+    except Exception as e:
+        log(f"Bot token check failed: {e}", "ERROR")
+        raise
     log(f"Target: {config.TARGET_USERNAME} / {getattr(config,'SCAMMER_REAL_PHONE','')}", "INFO")
     existing_sessions = 0
     for phone in getattr(config, "PHONE_NUMBERS", []):
