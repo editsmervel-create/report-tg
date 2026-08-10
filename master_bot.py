@@ -665,7 +665,15 @@ async def otp_code_received(msg: types.Message, state: FSMContext):
             continue
         client = STATE["clients"][phone]
         try:
-            await client.sign_in(phone, otp)
+            phone_code_hash = None
+            try:
+                phone_code_hash = (STATE.get("otp_pending") or {}).get(phone, {}).get("phone_code_hash")
+            except Exception:
+                phone_code_hash = None
+            if phone_code_hash:
+                await client.sign_in(phone=phone, code=otp, phone_code_hash=phone_code_hash)
+            else:
+                await client.sign_in(phone, otp)
             me = await client.get_me()
             log(f"Login OK: {phone} -> @{me.username} ({me.first_name})", "SUCCESS")
             STATE["otp_pending"].pop(phone, None)
