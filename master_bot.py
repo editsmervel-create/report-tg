@@ -564,6 +564,88 @@ async def cmd_cancel(msg: types.Message, state: FSMContext):
     await msg.answer("♻️ Cancelled.")
 
 
+@dp.message()
+async def fallback_login_inputs(msg: types.Message, state: FSMContext):
+    if not await is_owner(msg.chat.id):
+        return
+    try:
+        cur_state = await state.get_state()
+    except Exception:
+        cur_state = None
+    if cur_state in (
+        getattr(BotFSM.waiting_otp_phone, "state", None),
+        getattr(BotFSM.waiting_otp_code, "state", None),
+        getattr(BotFSM.waiting_2fa, "state", None),
+    ):
+        return
+    text = (msg.text or "").strip()
+    if ":" not in text:
+        return
+
+    raw_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    pairs = {}
+    for ln in raw_lines:
+        if ":" not in ln:
+            continue
+        ph, val = ln.split(":", 1)
+        ph = ph.strip().replace(" ", "")
+        val = val.strip()
+        if ph and val:
+            pairs[ph] = val
+
+    if not pairs:
+        return
+
+    otp_pending = STATE.get("otp_pending") or {}
+    twofa_pending = STATE.get("twofa_pending") or {}
+
+    handled = False
+    for phone, val in pairs.items():
+        if phone in otp_pending and phone in STATE.get("clients", {}):
+            client = STATE["clients"][phone]
+            try:
+                phone_code_hash = otp_pending.get(phone, {}).get("phone_code_hash")
+                if phone_code_hash:
+                    await client.sign_in(phone=phone, code=val, phone_code_hash=phone_code_hash)
+                else:
+                    await client.sign_in(phone, val)
+                me = await client.get_me()
+                STATE["otp_pending"].pop(phone, None)
+                await msg.answer(f"✅ <b>Logged In</b>\nPhone: <code>{phone}</code>\nUsername: @{me.username}\nID: <code>{me.id}</code>")
+                handled = True
+            except SessionPasswordNeededError:
+                STATE["twofa_pending"][phone] = True
+                await msg.answer(f"🔐 2FA required for <code>{phone}</code>. Send: <code>{phone}:PASSWORD</code>")
+                handled = True
+            except PhoneCodeInvalidError:
+                await msg.answer(f"❌ Wrong OTP for <code>{phone}</code>. Run /login again to request a fresh OTP.")
+                handled = True
+            except FloodWaitError as e:
+                await msg.answer(f"⏱️ FloodWait <code>{phone}</code>: {e.seconds}s. Try later.")
+                handled = True
+            except Exception as e:
+                await msg.answer(f"❌ Login failed <code>{phone}</code>: {e}")
+                handled = True
+
+        elif phone in twofa_pending and phone in STATE.get("clients", {}):
+            client = STATE["clients"][phone]
+            try:
+                await client.sign_in(password=val)
+                me = await client.get_me()
+                STATE["twofa_pending"].pop(phone, None)
+                STATE["otp_pending"].pop(phone, None)
+                await msg.answer(f"✅ 2FA OK: <code>{phone}</code> → @{me.username}")
+                handled = True
+            except Exception as e:
+                await msg.answer(f"❌ 2FA failed <code>{phone}</code>: {e}")
+                handled = True
+
+    if handled and getattr(config, "AUTO_START_REPORTS_AFTER_LOGIN", False):
+        started, _ = await start_reports_internal(bot)
+        if started:
+            await msg.answer("🚀 Auto-started reporting. Use /status for live stats. /stop_reports to halt.")
+
+
 @dp.message(BotFSM.waiting_otp_phone)
 async def otp_phone_received(msg: types.Message, state: FSMContext):
     raw = msg.text.strip()
